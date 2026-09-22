@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from . import crud, graph, safe_plans, seed
 from .database import get_connection, init_db
 from .schemas import (
+    ConfirmPlanIn,
     ExportBundle,
     ImportResult,
     IngredientIn,
@@ -274,6 +275,38 @@ def safe_plans_route(recipe_id: int, data: Optional[SafePlanIn] = None, conn=Dep
         raise HTTPException(404, "配方不存在")
     avoid = data.avoid_allergens if data else []
     return safe_plans.build_safe_plans(conn, recipe_id, avoid)
+
+
+@app.post("/api/recipes/{recipe_id}/confirm-plan")
+def confirm_plan_route(recipe_id: int, data: ConfirmPlanIn, conn=Depends(conn_dep)):
+    """确认一组安全方案：重新校验避开过敏原约束并生成合并采购清单。
+
+    校验失败统一返回 422，detail 为结构化的逐条原因，前端据此提示并引导重新生成。
+    """
+    if crud.get_recipe(conn, recipe_id) is None:
+        raise HTTPException(404, "配方不存在")
+    if not data.selections:
+        raise HTTPException(
+            422,
+            {
+                "message": "未收到任何方案选择，请从生成结果中为每种配料选定终点后再确认",
+                "failures": [],
+            },
+        )
+    result = safe_plans.confirm_plan(
+        conn, recipe_id, data.avoid_allergens, [s.model_dump() for s in data.selections]
+    )
+    if result is None:
+        raise HTTPException(404, "配方不存在")
+    if not result["valid"]:
+        raise HTTPException(
+            422,
+            {
+                "message": "所选方案已不再满足避开过敏原约束（原料、替代关系或过敏原可能已被修改），请重新生成方案",
+                "failures": result["failures"],
+            },
+        )
+    return result
 
 
 # ---------------- 两版配方差异对比 ----------------

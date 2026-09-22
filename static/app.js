@@ -13,8 +13,14 @@ async function api(path, options = {}) {
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
-    const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : `HTTP ${res.status}`;
-    throw new Error(detail);
+    const err = new Error(
+      data && data.detail
+        ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
+        : `HTTP ${res.status}`
+    );
+    err.status = res.status;
+    err.payload = data;
+    throw err;
   }
   return data;
 }
@@ -451,7 +457,7 @@ $("#btn-analyze").addEventListener("click", async () => {
 
 // ---------------- 安全替代方案 ----------------
 
-const safeState = { allergens: [], checked: new Set() };
+const safeState = { allergens: [], checked: new Set(), result: null, recipeId: null, confirmed: null };
 
 function renderSafeAllergenChecks() {
   const box = $("#safe-allergens");
@@ -489,7 +495,12 @@ async function loadSafeAllergens() {
   }
 }
 
-$("#safe-recipe").addEventListener("change", loadSafeAllergens);
+$("#safe-recipe").addEventListener("change", () => {
+  loadSafeAllergens();
+  safeState.result = null;
+  safeState.confirmed = null;
+  $("#safe-confirm-area")?.remove();
+});
 
 $("#safe-allergens").addEventListener("change", (e) => {
   const cb = e.target.closest('input[type="checkbox"]');
@@ -598,7 +609,10 @@ function renderSafePlans(data) {
             </tr>`).join("")}
         </tbody>
       </table>
-      <div class="plan-allergens">整方过敏原：${allergenTags(p.allergens)}</div>`;
+      <div class="plan-allergens">
+        整方过敏原：${allergenTags(p.allergens)}
+        <button type="button" class="btn primary tiny btn-confirm-plan" data-rank="${p.rank}" style="float:right">✓ 确认此方案并生成采购清单</button>
+      </div>`;
     return `
       <details class="card plan-card" ${p.rank === 1 ? "open" : ""}>
         <summary>
@@ -611,6 +625,7 @@ function renderSafePlans(data) {
       </details>`;
   }).join("");
 
+  html += `<div id="safe-confirm-area"></div>`;
   $("#safe-result").innerHTML = html;
 }
 
@@ -622,10 +637,219 @@ $("#btn-safe-search").addEventListener("click", async () => {
       method: "POST",
       body: { avoid_allergens: Array.from(safeState.checked) },
     });
+    safeState.result = data;
+    safeState.recipeId = id;
+    safeState.confirmed = null;
     renderSafePlans(data);
   } catch (err) {
+    safeState.result = null;
+    safeState.confirmed = null;
     toast(err.message, true);
   }
+});
+
+// ---------------- 确认方案 & 采购清单 ----------------
+
+const CONFIRM_FAIL_LABEL = {
+  forbidden: "终点含禁用过敏原",
+  endpoint_missing: "终点原料已缺失",
+  missing: "配料原料缺失",
+  not_in_recipe: "不属于当前配方",
+  row_mismatch: "配方行不匹配",
+  extra_selection: "选择超出配方",
+  missing_selection: "漏选终点",
+  path_changed: "替代路径已失效",
+  unreachable: "替代路径已不可达",
+  invalid_option: "候选当前不可用",
+  duplicate: "选择重复",
+};
+
+function renderConfirmFailures(detail) {
+  const failures = (detail && detail.failures) || [];
+  let rows = failures.map((f) => `
+    <tr>
+      <td><span class="code-mono">${esc(f.ingredient_code)}</span>${f.ingredient_name ? `<br><small>${esc(f.ingredient_name)}</small>` : ""}</td>
+      <td>${f.selected_code ? `<span class="code-mono">${esc(f.selected_code)}</span>` : '<span class="tag muted">未选择</span>'}</td>
+      <td><span class="badge cycle">${esc(CONFIRM_FAIL_LABEL[f.reason] || f.reason)}</span></td>
+      <td>${esc(f.reason_text)}</td>
+    </tr>`).join("");
+  if (!rows) rows = '<tr><td colspan="4" class="empty">无更多明细</td></tr>';
+  return `<div class="alert cycle" id="confirm-fail-box">
+      <strong>⚠ ${esc((detail && detail.message) || "所选方案未能通过后端校验")}</strong>
+      <div class="actions" style="margin-top:8px">
+        <button type="button" class="btn tiny primary" id="btn-revalidate">重新生成安全方案</button>
+      </div>
+      <table class="data-table" style="margin-top:10px">
+        <thead><tr><th>配料</th><th>所选终点</th><th>原因</th><th>说明</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderConfirmed(data) {
+  const rows = data.purchase_list;
+  const tableRows = rows.map((r) => `
+    <tr>
+      <td><span class="code-mono">${esc(r.selected_code)}</span><br><small>${esc(r.selected_name)}</small></td>
+      <td><strong>${r.quantity == null ? "—" : esc(r.quantity)}</strong></td>
+      <td>${esc(r.unit) || '<span class="tag muted">无单位</span>'}</td>
+      <td>${allergenTags(r.allergens)}</td>
+      <td>${r.merged ? `由 ${r.source_count} 项合并` : `${r.source_count} 项`}</td>
+      <td>${esc(r.note) || '<span class="tag muted">—</span>'}</td>
+    </tr>`).join("");
+
+  const detailRows = data.confirmed_items.map((c) => `
+    <tr class="${c.substituted ? "row-substituted" : ""}">
+      <td><span class="code-mono">${esc(c.ingredient_code)}</span><br><small>${esc(c.ingredient_name)}${c.quantity != null ? ` · ${c.quantity}${esc(c.unit || "")}` : ""}</small></td>
+      <td><span class="code-mono">${esc(c.selected_code)}</span><br><small>${esc(c.selected_name)}</small>${c.substituted ? ' <span class="tag new">已替代</span>' : ' <span class="tag ok">保留原方</span>'}</td>
+      <td><div class="path-line" style="border:none;background:none;padding:0">${safePathChain(c.path)}</div></td>
+      <td>${allergenTags(c.allergens)}</td>
+    </tr>`).join("");
+
+  let unmergedHtml = "";
+  if (data.unmerged_units.length) {
+    unmergedHtml = `<div class="alert warn">
+      <strong>⚠ ${data.unmerged_units.length} 项单位无法合并：</strong>
+      <ul style="margin:6px 0 0">
+        ${data.unmerged_units.map((u) => `<li><span class="code-mono">${esc(u.selected_code)}</span> ${esc(u.selected_name)}：${esc(u.reason)}${u.units ? `（${u.units.map((x) => esc(x || "无单位")).join(" / ")}）` : ""}</li>`).join("")}
+      </ul>
+    </div>`;
+  }
+
+  return `
+  <div class="card" id="purchase-card">
+    <div class="panel-head">
+      <h2>🧾 采购清单（已确认方案）</h2>
+      <div class="head-controls">
+        <button type="button" class="btn primary" id="btn-download-json">⬇ 下载 JSON</button>
+        <button type="button" class="btn primary" id="btn-download-csv">⬇ 下载 CSV</button>
+      </div>
+    </div>
+    <div class="summary-bar">
+      <div class="summary-box"><h4>配方</h4><strong>${esc(data.recipe.code)}</strong> v${esc(data.recipe.version)}<br><small>${esc(data.recipe.name)}</small></div>
+      <div class="summary-box"><h4>避开的过敏原</h4>${data.avoid_allergens.length ? allergenTags(data.avoid_allergens, "direct") : '<span class="tag muted">无</span>'}</div>
+      <div class="summary-box"><h4>整方过敏原</h4>${allergenTags(data.allergens)}</div>
+      <div class="summary-box"><h4>替换 / 确认时间</h4>${data.substitution_count} 项<br><small>${esc(data.confirmed_at)}</small></div>
+    </div>
+    ${unmergedHtml}
+    <h3>合并后的采购项（${rows.length} 行）</h3>
+    <table class="data-table">
+      <thead><tr><th>原料</th><th>数量</th><th>单位</th><th>过敏原</th><th>合并情况</th><th>说明</th></tr></thead>
+      <tbody>${tableRows || '<tr><td colspan="6" class="empty">无</td></tr>'}</tbody>
+    </table>
+    <details style="margin-top:14px">
+      <summary>查看每个配方配料的替代路径、过敏原与用量明细（${data.confirmed_items.length} 项）</summary>
+      <table class="data-table" style="margin-top:8px">
+        <thead><tr><th>原配料（用量）</th><th>最终入料</th><th>替代路径</th><th>过敏原</th></tr></thead>
+        <tbody>${detailRows}</tbody>
+      </table>
+    </details>
+  </div>`;
+}
+
+$("#safe-result").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".btn-confirm-plan");
+  if (!btn || !safeState.result) return;
+  const plan = safeState.result.plans.find((p) => p.rank === Number(btn.dataset.rank));
+  if (!plan) return;
+
+  const area = $("#safe-confirm-area");
+  area.innerHTML = '<div class="card hint">正在提交后端重新校验…</div>';
+
+  const body = {
+    avoid_allergens: Array.from(safeState.checked),
+    selections: plan.items.map((it) => ({
+      ingredient_code: it.ingredient_code,
+      selected_code: it.selected_code,
+      path_codes: it.path.map((n) => n.code),
+    })),
+  };
+
+  try {
+    const data = await api(`/api/recipes/${safeState.recipeId}/confirm-plan`, { method: "POST", body });
+    safeState.confirmed = data;
+    area.innerHTML = renderConfirmed(data);
+    area.scrollIntoView({ behavior: "smooth", block: "start" });
+    toast("方案已通过后端校验，采购清单已生成");
+  } catch (err) {
+    safeState.confirmed = null;
+    if (err.status === 422 && err.payload && err.payload.detail && err.payload.detail.failures) {
+      area.innerHTML = renderConfirmFailures(err.payload.detail);
+    } else {
+      area.innerHTML = "";
+    }
+    toast(err.message, true);
+  }
+});
+
+$("#safe-result").addEventListener("click", (e) => {
+  if (e.target.closest("#btn-revalidate")) $("#btn-safe-search").click();
+});
+
+function downloadBlob(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function purchaseFileBase(data) {
+  return `purchase-${data.recipe.code}-v${data.recipe.version}-${(data.confirmed_at || "").slice(0, 10) || new Date().toISOString().slice(0, 10)}`;
+}
+
+$("#safe-result").addEventListener("click", (e) => {
+  if (!e.target.closest("#btn-download-json") || !safeState.confirmed) return;
+  downloadBlob(
+    JSON.stringify(safeState.confirmed, null, 2),
+    `${purchaseFileBase(safeState.confirmed)}.json`,
+    "application/json"
+  );
+});
+
+function csvCell(v) {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function toPurchaseCsv(data) {
+  const header = [
+    "原料代码", "原料名称", "数量", "单位", "合并情况", "过敏原",
+    "来源配料", "来源配料名称", "来源用量", "来源单位",
+    "替代路径", "路径长度", "是否替代", "无法合并/备注",
+  ];
+  const lines = [header.map(csvCell).join(",")];
+  for (const row of data.purchase_list) {
+    for (const src of row.sources) {
+      const chain = src.path.map((n) => n.code).join(" -> ");
+      lines.push([
+        row.selected_code, row.selected_name,
+        row.quantity == null ? "" : row.quantity, row.unit,
+        row.merged ? `由 ${row.source_count} 项合并` : "",
+        row.allergens.join("、"),
+        src.ingredient_code, src.ingredient_name,
+        src.quantity == null ? "" : src.quantity, src.unit,
+        chain, src.path_length, src.substituted ? "是" : "否",
+        row.note,
+      ].map(csvCell).join(","));
+    }
+  }
+  for (const u of data.unmerged_units) {
+    const srcText = (u.sources || []).map((s) => `${s.ingredient_code}${s.quantity != null ? `×${s.quantity}${s.unit || ""}` : ""}`).join("; ");
+    lines.push([
+      u.selected_code, u.selected_name, "", u.units ? u.units.join("/") : (u.unit || ""),
+      "无法合并", "", "", "", "", "", "", "", "",
+      `${u.reason}｜来源: ${srcText}`,
+    ].map(csvCell).join(","));
+  }
+  return "﻿" + lines.join("\r\n");  // BOM，便于 Excel 识别 UTF-8
+}
+
+$("#safe-result").addEventListener("click", (e) => {
+  if (!e.target.closest("#btn-download-csv") || !safeState.confirmed) return;
+  downloadBlob(toPurchaseCsv(safeState.confirmed), `${purchaseFileBase(safeState.confirmed)}.csv`, "text/csv;charset=utf-8");
 });
 
 // ---------------- 版本对比 ----------------

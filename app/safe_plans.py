@@ -20,8 +20,16 @@
 
 当某配料没有任何安全候选时整方无解（例如原料缺失，或原料自身与全部
 可达无环终点都含禁用过敏原），此时返回阻塞配料及被排除候选路径的诊断。
+
+确认方案（confirm_plan）
+------------------------
+用户从生成结果中选定一组方案后，服务端**按当前数据重新校验**所选终点
+仍然满足避开过敏原约束（防止结果生成后原料/替代边/过敏原被改动而失效），
+随后按所选终点合并相同原料的数量与单位生成采购清单；无法合并的单位
+（同一终点对应多种不同单位或未填写数量）单独保留并给出说明。
 """
 import heapq
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import crud, graph
@@ -329,4 +337,389 @@ def build_safe_plans(conn, recipe_id: int, avoid_raw: Optional[List[str]]) -> Op
         "has_more": has_more,
         "plans": plans,
         "blocked": blocked,
+    }
+
+
+# ---------------- 确认方案：重新校验 + 采购清单合并 ----------------
+
+def _option_matches(opt: Dict[str, Any], selected_code: str, path_codes: List[str]) -> bool:
+    """用户所选是否与当前枚举出来的某个候选一致。
+
+    优先按完整路径节点代码序列精确匹配；前端未携带路径时退化为仅按终点匹配。
+    """
+    if opt["selected_code"] != selected_code:
+        return False
+    if not path_codes:
+        return True
+    return [n["code"] for n in opt["path"]] == list(path_codes)
+
+
+def _selection_failure(
+    sel: Dict[str, Any],
+    item: Optional[Any],
+    options: List[Dict[str, Any]],
+    nodes: Dict[str, Dict[str, Any]],
+    adjacency: Dict[str, List[Dict[str, str]]],
+    avoid_set: Set[str],
+) -> Tuple[str, str]:
+    """说明某一行配料的所选候选为什么当前不再合规。返回 (reason, reason_text)。"""
+    code = sel["ingredient_code"]
+    selected_code = sel["selected_code"]
+    path_codes = sel.get("path_codes") or []
+    unit_text = f"（单位：{item['unit'] or '无'}）" if item is not None else ""
+
+    root = graph._node_snapshot(nodes, code)
+    endpoint = graph._node_snapshot(nodes, selected_code)
+
+    if not root["exists"]:
+        return "missing", f"配料 {code} 已不在原料库中（缺失原料），无法确认{unit_text}"
+
+    # 终点原料是否还存在
+    if not endpoint["exists"]:
+        return "endpoint_missing", (
+            f"配料 {code} 所选的替代终点 {selected_code} 已不在原料库中，"
+            "替代关系可能已被删除或改动，请重新生成方案"
+        )
+
+    # 终点当前是否携带禁用过敏原
+    hits = sorted(set(endpoint["allergens"]) & avoid_set)
+    if hits:
+        return "forbidden", (
+            f"配料 {code} 所选的 {selected_code} 目前携带需避开的过敏原"
+            f"（{'、'.join(hits)}），请重新生成方案"
+        )
+
+    # 声称的路径是否仍构成一条简单路径且沿现有替代边可达
+    if path_codes:
+        chain_ok = path_codes[0] == code and path_codes[-1] == selected_code
+        if chain_ok:
+            for a, b in zip(path_codes, path_codes[1:]):
+                targets = {e["target_code"] for e in adjacency.get(a, [])}
+                if b not in targets:
+                    chain_ok = False
+                    break
+        if not chain_ok:
+            return "path_changed", (
+                f"配料 {code} 原选替代路径 {' → '.join(path_codes)} 已失效"
+                "（替代关系已被增删或改动），请重新生成方案"
+            )
+        if len(set(path_codes)) != len(path_codes):
+            return "path_changed", (
+                f"配料 {code} 原选替代路径出现重复节点（成环），请重新生成方案"
+            )
+        # 路径仍在且终点安全，只是没出现在枚举里——理论上不应发生
+        if not any(_option_matches(o, selected_code, path_codes) for o in options):
+            return "path_changed", (
+                f"配料 {code} 所选路径不再是合规的无环终点候选，请重新生成方案"
+            )
+        return "invalid_option", "所选候选当前不可用，请重新生成方案"
+
+    # 未携带路径：只要当前枚举里仍存在该终点候选即合规
+    if any(o["selected_code"] == selected_code for o in options):
+        return "invalid_option", "所选候选当前不可用，请重新生成方案"
+
+    # 终点安全但当前不可达（替代边被删）
+    return "unreachable", (
+        f"配料 {code} 已不存在通往 {selected_code} 的合规替代路径，"
+        "替代关系可能已被删除，请重新生成方案"
+    )
+
+def _qnum(v) -> Optional[float]:
+    """合并后的数量规整：去掉浮点误差，整数返回 int。"""
+    if v is None:
+        return None
+    r = round(float(v) + 0.0, 6)
+    return int(r) if r == int(r) else r
+
+
+def _merge_purchase(confirmed: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """按所选终点合并相同原料：同单位数量相加，不同单位保留为无法合并项。
+
+    返回 (purchase_rows, unmerged_units)。行的首次出现顺序即终点在配料表中
+    的出现顺序。
+    """
+    order: List[str] = []
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for c in confirmed:
+        code = c["selected_code"]
+        unit = c["unit"] or ""
+        if code not in grouped:
+            order.append(code)
+            grouped[code] = {
+                "selected_code": code,
+                "selected_name": c["selected_name"],
+                "allergens": list(c["allergens"]),
+                "by_unit": {},       # unit -> {"qty": float|None累加, "sources": [...]}
+                "unquantified": [],  # quantity 为空的来源
+            }
+        g = grouped[code]
+
+        source = {
+            "ingredient_code": c["ingredient_code"],
+            "ingredient_name": c["ingredient_name"],
+            "quantity": c["quantity"],
+            "unit": unit,
+            "substituted": c["substituted"],
+            "path_length": c["path_length"],
+            "path": c["path"],
+            "edges": c["edges"],
+        }
+
+        if c["quantity"] is None:
+            g["unquantified"].append(source)
+        else:
+            bu = g["by_unit"].setdefault(unit, {"qty": 0.0, "sources": []})
+            bu["qty"] += float(c["quantity"])
+            bu["sources"].append(source)
+
+    rows: List[Dict[str, Any]] = []
+    unmerged: List[Dict[str, Any]] = []
+
+    for code in order:
+        g = grouped[code]
+        units = sorted(g["by_unit"].keys())
+
+        # 有数值的单位各自成行（同单位才合并）
+        for unit in units:
+            bu = g["by_unit"][unit]
+            note = ""
+            if len(units) > 1:
+                others = "、".join(u or "（无单位）" for u in units if u != unit)
+                note = f"同一原料存在不同单位（{others}），未做跨单位换算，已分行列出"
+            rows.append(
+                {
+                    "selected_code": code,
+                    "selected_name": g["selected_name"],
+                    "quantity": _qnum(bu["qty"]),
+                    "unit": unit,
+                    "allergens": list(g["allergens"]),
+                    "merged": len(bu["sources"]) > 1,
+                    "source_count": len(bu["sources"]),
+                    "sources": bu["sources"],
+                    "note": note,
+                }
+            )
+
+        # 未填写数量的配料无法参与数量合并，单独成行
+        for src in g["unquantified"]:
+            rows.append(
+                {
+                    "selected_code": code,
+                    "selected_name": g["selected_name"],
+                    "quantity": None,
+                    "unit": src["unit"],
+                    "allergens": list(g["allergens"]),
+                    "merged": False,
+                    "source_count": 1,
+                    "sources": [src],
+                    "note": "原配料未填写数量，无法参与数量合并，请按配方人工核定",
+                }
+            )
+            unmerged.append(
+                {
+                    "selected_code": code,
+                    "selected_name": g["selected_name"],
+                    "unit": src["unit"],
+                    "reason": "原配料未填写数量，无法参与数量合并",
+                    "sources": [
+                        {"ingredient_code": src["ingredient_code"], "ingredient_name": src["ingredient_name"]}
+                    ],
+                }
+            )
+
+        # 多单位并存时，记录一条无法合并说明（同单位组合已各自成行）
+        if len(units) > 1:
+            unmerged.append(
+                {
+                    "selected_code": code,
+                    "selected_name": g["selected_name"],
+                    "unit": None,
+                    "reason": "同一终点原料对应多种不同单位，系统不做跨单位换算，已分别成行",
+                    "units": units,
+                    "sources": [
+                        {"ingredient_code": s["ingredient_code"], "ingredient_name": s["ingredient_name"],
+                         "quantity": s["quantity"], "unit": s["unit"]}
+                        for u in units for s in g["by_unit"][u]["sources"]
+                    ],
+                }
+            )
+
+    return rows, unmerged
+
+
+def confirm_plan(
+    conn,
+    recipe_id: int,
+    avoid_raw: Optional[List[str]],
+    selections: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """校验用户选定的方案仍满足避开过敏原约束，确认后生成合并采购清单。
+
+    返回 None 表示配方不存在；返回 {"valid": False, ...} 表示校验失败；
+    返回 {"valid": True, ...} 时含可下载的采购清单。
+    """
+    recipe = crud.get_recipe(conn, recipe_id)
+    if recipe is None:
+        return None
+
+    nodes, adjacency = graph._build_graph(conn)
+    items = conn.execute(
+        """SELECT ri.ingredient_code, ri.quantity, ri.unit,
+                  COALESCE(i.name, '') AS ingredient_name
+             FROM recipe_items ri
+             LEFT JOIN ingredients i ON i.code = ri.ingredient_code
+            WHERE ri.recipe_id = ?
+            ORDER BY ri.id""",
+        (recipe_id,),
+    ).fetchall()
+
+    avoid: List[str] = []
+    for raw in avoid_raw or []:
+        for allergen in normalize_allergens(raw):
+            if allergen not in avoid:
+                avoid.append(allergen)
+    avoid_set = set(avoid)
+
+    # 重新枚举当前数据下每个配料行的安全候选（与生成接口完全一致的规则）。
+    # 注意：配方允许同一原料代码出现多行，因此一切按"配方行（位置）"对齐，
+    # 不按 ingredient_code 去重。
+    options_per_row: List[List[Dict[str, Any]]] = []
+    for item in items:
+        options, _, _ = _enumerate_options(item["ingredient_code"], nodes, adjacency, avoid_set)
+        options_per_row.append(options)
+
+    failures: List[Dict[str, Any]] = []
+    matched_per_row: List[Optional[Dict[str, Any]]] = []
+
+    for idx in range(len(items)):
+        item = items[idx]
+        options = options_per_row[idx]
+        code = item["ingredient_code"]
+
+        if idx >= len(selections):
+            matched_per_row.append(None)
+            failures.append(
+                {
+                    "ingredient_code": code,
+                    "ingredient_name": item["ingredient_name"] or f"(缺失原料:{code})",
+                    "selected_code": None,
+                    "quantity": item["quantity"],
+                    "unit": item["unit"],
+                    "reason": "missing_selection",
+                    "reason_text": (
+                        f"第 {idx + 1} 行配料 {code} 未选择最终原料，"
+                        "请为配方中的每行配料各选择一个终点后再确认"
+                    ),
+                }
+            )
+            continue
+
+        sel = selections[idx]
+        selected_code = sel.get("selected_code")
+        path_codes = sel.get("path_codes") or []
+
+        # 提交行与配方行必须指向同一个配料
+        if sel.get("ingredient_code") != code:
+            matched_per_row.append(None)
+            failures.append(
+                {
+                    "ingredient_code": code,
+                    "ingredient_name": item["ingredient_name"] or f"(缺失原料:{code})",
+                    "selected_code": selected_code,
+                    "quantity": item["quantity"],
+                    "unit": item["unit"],
+                    "reason": "row_mismatch",
+                    "reason_text": (
+                        f"第 {idx + 1} 行提交的是配料 {sel.get('ingredient_code')}，"
+                        f"但当前配方该行是 {code}（配方可能已被修改），请重新生成方案"
+                    ),
+                }
+            )
+            continue
+
+        matched = next(
+            (o for o in options if _option_matches(o, selected_code, path_codes)),
+            None,
+        )
+        if matched is None:
+            reason, text = _selection_failure(
+                {"ingredient_code": code, "selected_code": selected_code, "path_codes": path_codes},
+                item, options, nodes, adjacency, avoid_set,
+            )
+            failures.append(
+                {
+                    "ingredient_code": code,
+                    "ingredient_name": item["ingredient_name"] or f"(缺失原料:{code})",
+                    "selected_code": selected_code,
+                    "quantity": item["quantity"],
+                    "unit": item["unit"],
+                    "reason": reason,
+                    "reason_text": text,
+                }
+            )
+        matched_per_row.append(matched)
+
+    if len(selections) > len(items):
+        for extra in selections[len(items):]:
+            failures.append(
+                {
+                    "ingredient_code": extra.get("ingredient_code"),
+                    "selected_code": extra.get("selected_code"),
+                    "reason": "extra_selection",
+                    "reason_text": (
+                        f"配料 {extra.get('ingredient_code')} 的选择超出当前配方行数"
+                        "（配方可能已被修改），请重新生成方案"
+                    ),
+                }
+            )
+
+    recipe_out = {
+        "id": recipe["id"],
+        "code": recipe["code"],
+        "version": recipe["version"],
+        "name": recipe["name"],
+        "note": recipe["note"],
+    }
+
+    if failures:
+        return {
+            "recipe": recipe_out,
+            "avoid_allergens": avoid,
+            "valid": False,
+            "failures": failures,
+        }
+
+    # 校验通过：以当前枚举到的候选为准组装确认明细（按配方行）
+    confirmed: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        opt = matched_per_row[idx]
+        confirmed.append(
+            {
+                "ingredient_code": item["ingredient_code"],
+                "ingredient_name": item["ingredient_name"]
+                or f"(缺失原料:{item['ingredient_code']})",
+                "quantity": item["quantity"],
+                "unit": item["unit"],
+                "substituted": opt["path_length"] > 0,
+                "selected_code": opt["selected_code"],
+                "selected_name": opt["selected_name"],
+                "path_length": opt["path_length"],
+                "path": opt["path"],
+                "edges": opt["edges"],
+                "allergens": opt["allergens"],
+            }
+        )
+
+    purchase_rows, unmerged = _merge_purchase(confirmed)
+    return {
+        "recipe": recipe_out,
+        "avoid_allergens": avoid,
+        "valid": True,
+        "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+        "substitution_count": sum(1 for c in confirmed if c["substituted"]),
+        "allergens": graph._union([c["allergens"] for c in confirmed]),
+        "confirmed_items": confirmed,
+        "purchase_list": purchase_rows,
+        "unmerged_units": unmerged,
     }

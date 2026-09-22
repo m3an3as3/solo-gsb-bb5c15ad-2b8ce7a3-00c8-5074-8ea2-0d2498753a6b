@@ -78,6 +78,20 @@ class SafePlanIn(BaseModel):
     avoid_allergens: List[str] = Field(default_factory=list, description="需要避开的过敏原列表")
 
 
+class PlanSelectionItemIn(BaseModel):
+    ingredient_code: str = Field(..., min_length=1, description="配方配料（原料）代码")
+    selected_code: str = Field(..., min_length=1, description="所选终点原料代码")
+    path_codes: List[str] = Field(
+        default_factory=list,
+        description="生成结果中的替代路径节点代码序列（根→终点），用于精确匹配候选",
+    )
+
+
+class ConfirmPlanIn(BaseModel):
+    avoid_allergens: List[str] = Field(default_factory=list, description="生成方案时勾选的需避开过敏原")
+    selections: List[PlanSelectionItemIn] = Field(default_factory=list, description="用户选定的一组方案")
+
+
 class ExportBundle(BaseModel):
     ingredients: List[IngredientIn] = []
     recipes: List[RecipeIn] = []

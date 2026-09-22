@@ -238,6 +238,8 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #bfe0cd; border-c
 .plan-card .data-table { border: none; border-radius: 0; }
 .plan-card td, .plan-card th { font-size: 13px; }
 .plan-allergens { padding: 10px 16px; font-size: 13px; }
+.plan-allergens .btn-confirm-plan { float: right; margin-top: -2px; }
+.plan-allergens::after { content: ""; display: block; clear: both; }
 tr.row-substituted td { background: var(--ok-bg); }
 .path-node.missing-node { background: #f3c7c1; text-decoration: underline wavy var(--warn); }
 .blocked-block .blocked-reason { font-size: 13px; color: var(--danger); margin: 4px 0 8px; }
