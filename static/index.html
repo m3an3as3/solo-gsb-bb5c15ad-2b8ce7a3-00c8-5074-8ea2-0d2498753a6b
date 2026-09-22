@@ -130,6 +130,12 @@
       </div>
     </div>
     <div id="safe-result"></div>
+    <div class="card confirm-bar hidden" id="safe-confirm-bar">
+      <span class="confirm-picked">尚未选择方案</span>
+      <span class="hint" style="margin:0">从上方方案中选择一组，确认时后端会基于当前数据重新校验过敏原约束并合并采购清单。</span>
+      <button class="btn primary" id="btn-safe-confirm" disabled>✓ 确认方案并生成采购清单</button>
+    </div>
+    <div id="safe-confirmed"></div>
   </section>
 
   <!-- ========== 版本对比 ========== -->

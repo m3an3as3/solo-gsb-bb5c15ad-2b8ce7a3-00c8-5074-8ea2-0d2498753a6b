@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from . import crud, graph, safe_plans, seed
 from .database import get_connection, init_db
 from .schemas import (
+    ConfirmPlanIn,
     ExportBundle,
     ImportResult,
     IngredientIn,
@@ -274,6 +275,21 @@ def safe_plans_route(recipe_id: int, data: Optional[SafePlanIn] = None, conn=Dep
         raise HTTPException(404, "配方不存在")
     avoid = data.avoid_allergens if data else []
     return safe_plans.build_safe_plans(conn, recipe_id, avoid)
+
+
+@app.post("/api/recipes/{recipe_id}/confirm-plan")
+def confirm_plan_route(recipe_id: int, data: ConfirmPlanIn, conn=Depends(conn_dep)):
+    if crud.get_recipe(conn, recipe_id) is None:
+        raise HTTPException(404, "配方不存在")
+    selections = [s.model_dump() for s in data.selections]
+    try:
+        result = safe_plans.confirm_plan(conn, recipe_id, data.avoid_allergens, selections)
+    except safe_plans.PlanConfirmationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": exc.message, "errors": exc.errors},
+        )
+    return result
 
 
 # ---------------- 两版配方差异对比 ----------------

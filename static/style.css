@@ -233,12 +233,47 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #bfe0cd; border-c
   font-size: 14px;
 }
 .plan-card[open] summary { border-bottom: 1px solid var(--line); background: #fafbfa; }
+.plan-card.picked { border-color: var(--primary); box-shadow: 0 0 0 2px #bfe0cd inset; }
+.plan-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--primary-dark);
+  background: var(--ok-bg);
+  border: 1px solid #aed9c0;
+  border-radius: 999px;
+  padding: 3px 12px;
+  user-select: none;
+}
+.plan-pick input { margin: 0; }
+.plan-pick:hover { border-color: var(--primary); }
 .plan-rank { font-weight: 700; color: var(--primary-dark); font-size: 15px; min-width: 34px; }
 .plan-summary-allergens { margin-left: auto; }
 .plan-card .data-table { border: none; border-radius: 0; }
 .plan-card td, .plan-card th { font-size: 13px; }
 .plan-allergens { padding: 10px 16px; font-size: 13px; }
 tr.row-substituted td { background: var(--ok-bg); }
+tr.row-added td { background: var(--ok-bg); }
+
+/* 确认方案栏 + 采购清单 */
+.confirm-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  position: sticky;
+  bottom: 12px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.12);
+}
+.confirm-picked { font-size: 14px; font-weight: 600; color: var(--primary-dark); white-space: nowrap; }
+.confirm-bar .btn.primary { margin-left: auto; }
+.confirm-bar .btn.primary:disabled { background: #b9c6c0; border-color: #b9c6c0; color: #f2f5f3; cursor: not-allowed; }
+.confirmed-card h3 { margin: 0; font-size: 17px; }
+.confirm-errors { margin: 10px 0 0; padding-left: 20px; }
+.confirm-errors li { margin-bottom: 8px; font-size: 13px; }
+.confirm-errors .blocked-reason { color: var(--danger); font-size: 12px; margin-top: 3px; }
 .path-node.missing-node { background: #f3c7c1; text-decoration: underline wavy var(--warn); }
 .blocked-block .blocked-reason { font-size: 13px; color: var(--danger); margin: 4px 0 8px; }
 .blocked-block details summary { font-size: 13px; color: var(--muted); cursor: pointer; margin: 6px 0; }

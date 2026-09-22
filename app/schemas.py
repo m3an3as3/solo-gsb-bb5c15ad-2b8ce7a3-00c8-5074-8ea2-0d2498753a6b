@@ -78,6 +78,16 @@ class SafePlanIn(BaseModel):
     avoid_allergens: List[str] = Field(default_factory=list, description="需要避开的过敏原列表")
 
 
+class PlanSelectionIn(BaseModel):
+    ingredient_code: str = Field(..., min_length=1, description="配方配料（原料）代码")
+    selected_code: str = Field(..., min_length=1, description="该配料确认选用的终点原料代码")
+
+
+class ConfirmPlanIn(BaseModel):
+    avoid_allergens: List[str] = Field(default_factory=list, description="需要避开的过敏原列表")
+    selections: List[PlanSelectionIn] = Field(..., description="按配方配料行顺序逐行对应的终点原料选择（同一原料可占多行）")
+
+
 class ExportBundle(BaseModel):
     ingredients: List[IngredientIn] = []
     recipes: List[RecipeIn] = []

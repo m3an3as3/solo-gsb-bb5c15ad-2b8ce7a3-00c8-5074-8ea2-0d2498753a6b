@@ -22,6 +22,7 @@
 可达无环终点都含禁用过敏原），此时返回阻塞配料及被排除候选路径的诊断。
 """
 import heapq
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import crud, graph
@@ -29,6 +30,15 @@ from .schemas import normalize_allergens
 
 MAX_PLANS = 50
 MAX_SAMPLE_PATHS = 10
+
+
+class PlanConfirmationError(Exception):
+    """确认方案校验失败：携带可直接展示给前端的结构化诊断。"""
+
+    def __init__(self, message: str, errors: List[Dict[str, Any]]):
+        super().__init__(message)
+        self.message = message
+        self.errors = errors
 
 
 # ---------------- 单配料候选枚举 ----------------
@@ -329,4 +339,404 @@ def build_safe_plans(conn, recipe_id: int, avoid_raw: Optional[List[str]]) -> Op
         "has_more": has_more,
         "plans": plans,
         "blocked": blocked,
+    }
+
+
+# ---------------- 确认方案：重新校验 ----------------
+
+def _find_path(
+    nodes: Dict[str, Dict[str, Any]],
+    adjacency: Dict[str, List[Dict[str, str]]],
+    root_code: str,
+    target_code: str,
+):
+    """沿现有替代边找一条 root -> target 的无环（简单）路径，BFS 取最短。
+
+    返回 (path_nodes, edges)；root==target 时为长度 0 路径；
+    目标不存在、不是无环终点（仍有出边的中间节点）或不可达
+    （含仅能成环到达）时返回 None。
+    """
+    root = graph._node_snapshot(nodes, root_code)
+    if not root["exists"]:
+        return None
+    if root_code == target_code:
+        return [root], []
+    if target_code not in nodes:
+        return None
+    # 与方案生成规则一致：非自身终点必须是无出边的无环终点，
+    # 中间节点（即便其出边只会成环）不能作为最终入料
+    if adjacency.get(target_code):
+        return None
+
+    queue: List[Tuple[List[str], List[Dict[str, str]]]] = [([root_code], [])]
+    head = 0
+    while head < len(queue):
+        codes, edges = queue[head]
+        head += 1
+        if len(edges) >= graph.MAX_DEPTH:
+            continue
+        current = codes[-1]
+        for edge in adjacency.get(current, []):
+            target = edge["target_code"]
+            if target in codes:
+                continue  # 成环路径不能作为确认的替代路径
+            new_codes = codes + [target]
+            new_edges = edges + [
+                {"source_code": current, "target_code": target, "note": edge.get("note", "")}
+            ]
+            if target == target_code:
+                return [graph._node_snapshot(nodes, c) for c in new_codes], new_edges
+            queue.append((new_codes, new_edges))
+    return None
+
+
+def _error_entry(
+    error_type: str,
+    message: str,
+    ingredient_code: str,
+    ingredient_name: str = "",
+    selected_code: Optional[str] = None,
+    trigger_allergens: Optional[List[str]] = None,
+    blocked: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    entry = {
+        "type": error_type,
+        "message": message,
+        "ingredient_code": ingredient_code,
+        "ingredient_name": ingredient_name,
+        "selected_code": selected_code,
+        "trigger_allergens": trigger_allergens or [],
+    }
+    if blocked is not None:
+        entry["blocked"] = blocked
+    return entry
+
+
+def confirm_plan(
+    conn,
+    recipe_id: int,
+    avoid_raw: Optional[List[str]],
+    selections_raw: List[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    """校验用户选定的方案并生成合并后的采购清单。
+
+    校验基于**当前数据库快照**重新执行（而非信任生成时的结果）：
+    - selections 按配方配料行顺序逐行对应（同一原料可在配方中占多行），
+      少传 / 多传 / 配料错位都按结构错误返回；
+    - 所选终点沿现有替代边存在无环简单路径可达：原料本身为长度 0，
+      非自身终点还必须是无出边的无环终点（中间节点不可作为最终入料）；
+    - 终点原料存在，且其自身过敏原不命中需避开的过敏原。
+    任一不满足即抛 PlanConfirmationError（携带逐项结构化诊断）。
+    """
+    recipe = crud.get_recipe(conn, recipe_id)
+    if recipe is None:
+        return None
+
+    nodes, adjacency = graph._build_graph(conn)
+    items = conn.execute(
+        """SELECT ri.ingredient_code, ri.quantity, ri.unit,
+                  COALESCE(i.name, '') AS ingredient_name
+             FROM recipe_items ri
+             LEFT JOIN ingredients i ON i.code = ri.ingredient_code
+            WHERE ri.recipe_id = ?
+            ORDER BY ri.id""",
+        (recipe_id,),
+    ).fetchall()
+
+    avoid: List[str] = []
+    for raw in avoid_raw or []:
+        for allergen in normalize_allergens(raw):
+            if allergen not in avoid:
+                avoid.append(allergen)
+    avoid_set = set(avoid)
+
+    errors: List[Dict[str, Any]] = []
+
+    # 1) 结构校验：选择按**配料行顺序**逐行对应（同一原料在配方中可能出现多行，
+    #    如分两次投料的 100g + 50g；前端提交的就是生成方案时的 plan.items 顺序）。
+    n_items = len(items)
+    n_sel = len(selections_raw)
+    chosen: List[Optional[str]] = [None] * n_items
+
+    for i, sel in enumerate(selections_raw):
+        if i >= n_items:
+            errors.append(
+                _error_entry(
+                    "extra_selection",
+                    f"第 {i + 1} 条选择超出当前配方配料数量，配方在方案生成后可能已变更，请重新生成方案",
+                    sel["ingredient_code"],
+                    "",
+                    sel["selected_code"],
+                )
+            )
+            continue
+        item = items[i]
+        if sel["ingredient_code"] != item["ingredient_code"]:
+            errors.append(
+                _error_entry(
+                    "selection_mismatch",
+                    f"第 {i + 1} 个配料应为 {item['ingredient_code']}，"
+                    f"提交的却是 {sel['ingredient_code']}，配方在方案生成后可能已变更，请重新生成方案",
+                    item["ingredient_code"],
+                    item["ingredient_name"],
+                    sel["selected_code"],
+                )
+            )
+            continue
+        chosen[i] = sel["selected_code"]
+
+    for i, item in enumerate(items):
+        if i >= n_sel:
+            errors.append(
+                _error_entry(
+                    "missing_selection",
+                    f"第 {i + 1} 个配料 {item['ingredient_name'] or item['ingredient_code']}"
+                    f"（{item['ingredient_code']}）缺少选择，请为其指定一个终点原料",
+                    item["ingredient_code"],
+                    item["ingredient_name"],
+                )
+            )
+
+    # 2) 逐行重新校验终点：存在性 / 可达性 / 过敏原约束
+    confirmed: List[Dict[str, Any]] = []
+    for i, item in enumerate(items):
+        code = item["ingredient_code"]
+        target = chosen[i]
+        if target is None:
+            continue  # 已记 missing_selection / mismatch
+
+        root_snap = graph._node_snapshot(nodes, code)
+        target_snap = graph._node_snapshot(nodes, target)
+
+        def _blocked_diag():
+            options, excluded, root_meta = _enumerate_options(code, nodes, adjacency, avoid_set)
+            if options:
+                return None
+            return _blocked_entry(item, root_meta, excluded)
+
+        if not root_snap["exists"]:
+            errors.append(
+                _error_entry(
+                    "missing",
+                    f"配料 {code} 引用的原料在原料库中缺失，无法参与替代与采购",
+                    code,
+                    item["ingredient_name"],
+                    target,
+                    blocked=_blocked_diag(),
+                )
+            )
+            continue
+        if not target_snap["exists"]:
+            errors.append(
+                _error_entry(
+                    "missing",
+                    f"所选终点原料 {target} 在原料库中不存在（缺失节点），无法采购",
+                    code,
+                    item["ingredient_name"],
+                    target,
+                    blocked=_blocked_diag(),
+                )
+            )
+            continue
+
+        found = _find_path(nodes, adjacency, code, target)
+        if found is None:
+            errors.append(
+                _error_entry(
+                    "unreachable",
+                    f"配料 {code} 无法沿现有替代边（无环）到达所选原料 {target}，请重新选择",
+                    code,
+                    item["ingredient_name"],
+                    target,
+                    blocked=_blocked_diag(),
+                )
+            )
+            continue
+
+        path_nodes, path_edges = found
+        endpoint = path_nodes[-1]
+        hits = sorted(set(endpoint["allergens"]) & avoid_set)
+        if hits:
+            errors.append(
+                _error_entry(
+                    "forbidden",
+                    f"所选原料 {target} 含需避开的过敏原（{'、'.join(hits)}），校验未通过",
+                    code,
+                    item["ingredient_name"],
+                    target,
+                    trigger_allergens=hits,
+                    blocked=_blocked_diag(),
+                )
+            )
+            continue
+
+        confirmed.append(
+            {
+                "ingredient_code": code,
+                "ingredient_name": item["ingredient_name"] or f"(缺失原料:{code})",
+                "quantity": item["quantity"],
+                "unit": item["unit"],
+                "substituted": len(path_edges) > 0,
+                "selected_code": target,
+                "selected_name": endpoint["name"],
+                "path_length": len(path_edges),
+                "path": [_node_dict(n) for n in path_nodes],
+                "edges": _edge_dict(path_edges),
+                "path_chain": " → ".join(n["code"] for n in path_nodes),
+                "allergens": list(endpoint["allergens"]),
+            }
+        )
+
+    if errors:
+        raise PlanConfirmationError(
+            f"方案校验未通过：{len(errors)} 个配料的选择不再满足避开过敏原等约束",
+            errors,
+        )
+
+    return _build_confirmation(recipe, avoid, confirmed)
+
+
+# ---------------- 采购清单合并 ----------------
+
+def _clean_number(value):
+    if value is None:
+        return None
+    num = round(float(value), 6)
+    return int(num) if num == int(num) else num
+
+
+def _source_label(source: Dict[str, Any]) -> str:
+    qty = source["quantity"]
+    return f"{source['ingredient_code']} {source['ingredient_name']}（{qty if qty is not None else '用量未登记'}{source['unit'] or ''}）"
+
+
+def _build_confirmation(
+    recipe,
+    avoid: List[str],
+    items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """按所选终点合并相同原料：同单位数量相加，不同单位分行并给出说明。"""
+    # group: selected_code -> 聚合状态
+    groups: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for source in items:
+        code = source["selected_code"]
+        group = groups.get(code)
+        if group is None:
+            group = {
+                "selected_code": code,
+                "selected_name": source["selected_name"],
+                "allergens": list(source["allergens"]),
+                "buckets": {},       # unit_key -> {"unit", "order", "sources", "total"}
+                "no_qty": [],        # 未登记用量的来源（各自成行）
+                "unit_keys": set(),
+            }
+            groups[code] = group
+            order.append(code)
+        group["unit_keys"].add((source["unit"] or "").strip().casefold())
+        qty = _clean_number(source["quantity"])
+        ref = {
+            "ingredient_code": source["ingredient_code"],
+            "ingredient_name": source["ingredient_name"],
+            "quantity": qty,
+            "unit": source["unit"],
+        }
+        if qty is None:
+            group["no_qty"].append(ref)
+        else:
+            key = (source["unit"] or "").strip().casefold()
+            bucket = group["buckets"].get(key)
+            if bucket is None:
+                bucket = {"unit": (source["unit"] or "").strip(), "sources": [], "total": 0.0}
+                group["buckets"][key] = bucket
+            bucket["sources"].append(ref)
+            bucket["total"] += qty
+
+    lines: List[Dict[str, Any]] = []
+    merge_notes: List[str] = []
+    seq = 0
+    for code in order:
+        group = groups[code]
+        endpoint = f"{group['selected_name']}（{group['selected_code']}）"
+
+        unit_warning = ""
+        if len(group["unit_keys"]) > 1:
+            unit_warning = (
+                f"注意：{endpoint} 在各配料中存在不同单位，已按单位分行，"
+                "未做跨单位换算合并，请人工核对"
+            )
+            merge_notes.append(unit_warning)
+
+        for bucket in group["buckets"].values():
+            seq += 1
+            total = _clean_number(bucket["total"])
+            merged = len(bucket["sources"]) > 1
+            note = ""
+            if merged:
+                note = (
+                    f"由 {len(bucket['sources'])} 个配料合并："
+                    + "、".join(_source_label({**s, "unit": bucket["unit"]}) for s in bucket["sources"])
+                    + "，相同单位数量已相加"
+                )
+            if unit_warning:
+                note = (note + "；" if note else "") + unit_warning
+            lines.append(
+                {
+                    "seq": seq,
+                    "selected_code": group["selected_code"],
+                    "selected_name": group["selected_name"],
+                    "quantity": total,
+                    "unit": bucket["unit"],
+                    "allergens": list(group["allergens"]),
+                    "merged": merged,
+                    "merged_from": bucket["sources"],
+                    "merge_note": note,
+                }
+            )
+
+        for ref in group["no_qty"]:
+            seq += 1
+            note = f"{_source_label(ref)} 未登记用量，未参与数量合并，请按实际需要采购"
+            merge_notes.append(note)
+            if unit_warning:
+                note += "；" + unit_warning
+            lines.append(
+                {
+                    "seq": seq,
+                    "selected_code": group["selected_code"],
+                    "selected_name": group["selected_name"],
+                    "quantity": None,
+                    "unit": ref["unit"] or "",
+                    "allergens": list(group["allergens"]),
+                    "merged": False,
+                    "merged_from": [ref],
+                    "merge_note": note,
+                }
+            )
+
+    substitution_count = sum(1 for it in items if it["substituted"])
+    all_allergens = graph._union([it["allergens"] for it in items])
+    return {
+        "recipe": {
+            "id": recipe["id"],
+            "code": recipe["code"],
+            "version": recipe["version"],
+            "name": recipe["name"],
+            "note": recipe["note"],
+        },
+        "avoid_allergens": avoid,
+        "validated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "item_count": len(items),
+            "substitution_count": substitution_count,
+            "purchase_line_count": len(lines),
+            "allergens": all_allergens,
+        },
+        "items": items,
+        "shopping_list": {
+            "title": f"采购清单 · {recipe['code']} v{recipe['version']} {recipe['name']}",
+            "lines": lines,
+            "merge_notes": merge_notes,
+        },
     }
